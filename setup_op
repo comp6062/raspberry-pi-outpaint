@@ -1,0 +1,444 @@
+install -Dm755 /dev/stdin "$HOME/setup_op" <<'SH'
+#!/usr/bin/env bash
+# Raspberry Pi 5 Local Outpainting — One-shot Installer
+# Target: Raspberry Pi OS Bookworm 64-bit (ARM64), CPU-only, 127.0.0.1:8080
+set -euo pipefail
+
+APP_DIR="$HOME/op_app"
+APP_SRC="$APP_DIR/app"
+VENV_DIR="$APP_DIR/.venv"
+LOG_DIR="$APP_DIR/logs"
+TMP_DIR="$APP_DIR/tmp"
+MODEL_DIR="$APP_DIR/models"
+SYS_DIR="$APP_DIR/systemd"
+PORT=8080
+HOST="127.0.0.1"
+PYTHON_MIN=3.11
+
+red(){ printf "\033[31m%s\033[0m\n" "$*"; }
+green(){ printf "\033[32m%s\033[0m\n" "$*"; }
+yellow(){ printf "\033[33m%s\033[0m\n" "$*"; }
+need_cmd(){ command -v "$1" >/dev/null 2>&1 || { red "Missing command: $1"; exit 1; }; }
+
+check_python(){
+  need_cmd python3
+  local pv
+  pv="$(python3 - <<'PYMIN'
+import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")
+PYMIN
+)"
+  awk -v v1="$pv" -v v2="$PYTHON_MIN" 'BEGIN{split(v1,a,".");split(v2,b,".");exit (a[1]>b[1] || (a[1]==b[1] && a[2]>=b[2]))?0:1}' \
+    || { red "Python >= ${PYTHON_MIN} required (found ${pv})"; exit 1; }
+}
+
+check_port_free(){
+  if ss -ltn | awk '{print $4}' | grep -q "^${HOST}:${PORT}\$"; then
+    red "Port ${PORT} on ${HOST} is already in use."
+    exit 1
+  fi
+}
+
+mk_layout(){
+  mkdir -p "$APP_DIR" "$APP_SRC/static" "$APP_SRC/templates" "$LOG_DIR" "$TMP_DIR" "$MODEL_DIR" "$SYS_DIR"
+}
+
+install_apt_deps(){
+  yellow "Installing OS packages (sudo may prompt)..."
+  if command -v sudo >/dev/null 2>&1; then SUDO=sudo; else SUDO=; fi
+  $SUDO apt-get update -y
+  $SUDO apt-get install -y python3-venv python3-opencv libatlas-base-dev libjpeg-dev zlib1g-dev libopenblas-dev curl jq
+}
+
+create_venv(){
+  if [ ! -d "$VENV_DIR" ]; then
+    python3 -m venv --system-site-packages "$VENV_DIR"
+  fi
+  # shellcheck disable=SC1091
+  source "$VENV_DIR/bin/activate"
+  python -m pip install --upgrade pip wheel setuptools
+  pip install fastapi==0.115.0 uvicorn[standard]==0.30.6 pillow==10.4.0 numpy==1.26.4 python-multipart==0.0.9 piexif==1.1.3 onnxruntime==1.18.1
+}
+
+write_files(){
+  # __init__.py
+  install -Dm644 /dev/stdin "$APP_SRC/__init__.py" <<'PY_INIT'
+# package marker
+PY_INIT
+
+  # main.py
+  install -Dm644 /dev/stdin "$APP_SRC/main.py" <<'PY_MAIN'
+import io, os, json
+from datetime import datetime
+from fastapi import FastAPI, UploadFile, File, Form, Request
+from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
+from PIL import Image, ImageDraw
+import numpy as np
+import cv2
+import piexif
+
+APP_DIR = os.path.expanduser("~/op_app")
+MODEL_DIR = os.path.join(APP_DIR, "models")
+LOG_DIR = os.path.join(APP_DIR, "logs")
+TMP_DIR = os.path.join(APP_DIR, "tmp")
+
+HOST, PORT = "127.0.0.1", 8080
+MAX_UPLOAD_MB, MAX_SIDE = 20, 1536
+
+FACE_PROTO_URL = "https://raw.githubusercontent.com/opencv/opencv/master/samples/dnn/face_detector/deploy.prototxt"
+FACE_MODEL_URL = "https://github.com/opencv/opencv_3rdparty/raw/dnn_samples_face_detector_20170830/res10_300x300_ssd_iter_140000.caffemodel"
+FACE_PROTO_PATH = os.path.join(MODEL_DIR, "deploy.prototxt")
+FACE_MODEL_PATH = os.path.join(MODEL_DIR, "res10_300x300_ssd_iter_140000.caffemodel")
+
+app = FastAPI(title="RPi5 Outpainting (Local)")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://127.0.0.1", "http://localhost"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+app.mount("/static", StaticFiles(directory=os.path.join(APP_DIR, "app/static")), name="static")
+
+def log(msg: str):
+  ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+  with open(os.path.join(LOG_DIR, "server.log"), "a", encoding="utf-8") as f:
+    f.write(f"[{ts}] {msg}\n")
+
+def ensure_models():
+  os.makedirs(MODEL_DIR, exist_ok=True)
+  if not os.path.exists(FACE_PROTO_PATH):
+    os.system(f"curl -L --fail -o {FACE_PROTO_PATH} {FACE_PROTO_URL}")
+  if not os.path.exists(FACE_MODEL_PATH):
+    os.system(f"curl -L --fail -o {FACE_MODEL_PATH} {FACE_MODEL_URL}")
+
+def read_image_keep_exif(data: bytes):
+  exif = None
+  try:
+    exif = piexif.load(io.BytesIO(data))
+  except Exception:
+    exif = None
+  img = Image.open(io.BytesIO(data)).convert("RGB")
+  return img, exif
+
+def clamp_size(img: Image.Image) -> Image.Image:
+  w, h = img.size
+  scale = min(1.0, float(MAX_SIDE) / max(w, h))
+  if scale < 1.0:
+    img = img.resize((int(w*scale), int(h*scale)), Image.LANCZOS)
+  return img
+
+def expand_canvas_and_mask(img: Image.Image, top: int, right: int, bottom: int, left: int):
+  w, h = img.size
+  W, H = w + left + right, h + top + bottom
+  canvas = Image.new("RGB", (W, H), (0, 0, 0))
+  canvas.paste(img, (left, top))
+  mask = Image.new("L", (W, H), 0)
+  d = ImageDraw.Draw(mask)
+  if top    > 0: d.rectangle((0, 0, W-1, top-1), fill=255)
+  if bottom > 0: d.rectangle((0, H-bottom, W-1, H-1), fill=255)
+  if left   > 0: d.rectangle((0, 0, left-1, H-1), fill=255)
+  if right  > 0: d.rectangle((W-right, 0, W-1, H-1), fill=255)
+  return canvas, mask
+
+def to_cv(img: Image.Image): return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+def from_cv(arr: np.ndarray): return Image.fromarray(cv2.cvtColor(arr, cv2.COLOR_BGR2RGB))
+
+def inpaint_borders(canvas: Image.Image, mask_img: Image.Image, passes: int = 3) -> Image.Image:
+  src = to_cv(canvas)
+  mask = np.array(mask_img)
+  if mask.ndim == 3:
+    mask = cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY)
+  mask = (mask > 0).astype(np.uint8) * 255
+  kernel = np.ones((5,5), np.uint8)
+  mask = cv2.dilate(mask, kernel, iterations=1)
+
+  out = src.copy()
+  for i in range(passes):
+    method = cv2.INPAINT_TELEA if (i % 2 == 0) else cv2.INPAINT_NS
+    out = cv2.inpaint(out, mask, 3, method)
+    out = cv2.GaussianBlur(out, (0,0), 0.8)
+    out = cv2.addWeighted(out, 1.35, cv2.GaussianBlur(out,(0,0),1.15), -0.35, 0)
+  return from_cv(out)
+
+def photoreal_refine(img: Image.Image) -> Image.Image:
+  cv = to_cv(img)
+  smooth = cv2.bilateralFilter(cv, d=9, sigmaColor=75, sigmaSpace=75)
+  lab = cv2.cvtColor(smooth, cv2.COLOR_BGR2LAB)
+  l, a, b = cv2.split(lab)
+  clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+  l2 = clahe.apply(l)
+  out = cv2.cvtColor(cv2.merge([l2,a,b]), cv2.COLOR_LAB2BGR)
+  return from_cv(out)
+
+def face_preserve(img: Image.Image) -> Image.Image:
+  ensure_models()
+  if not (os.path.exists(FACE_PROTO_PATH) and os.path.exists(FACE_MODEL_PATH)):
+    return img
+  try:
+    net = cv2.dnn.readNetFromCaffe(FACE_PROTO_PATH, FACE_MODEL_PATH)
+  except Exception:
+    return img
+  cv = to_cv(img)
+  h, w = cv.shape[:2]
+  blob = cv2.dnn.blobFromImage(cv2.resize(cv,(300,300)), 1.0, (300,300), (104.0,177.0,123.0))
+  net.setInput(blob)
+  det = net.forward()
+  for i in range(det.shape[2]):
+    conf = float(det[0,0,i,2])
+    if conf < 0.6: continue
+    x1,y1,x2,y2 = (det[0,0,i,3:7]*np.array([w,h,w,h])).astype(int)
+    x1,y1 = max(0,x1-10), max(0,y1-10)
+    x2,y2 = min(w-1,x2+10), min(h-1,y2+10)
+    face = cv[y1:y2, x1:x2]
+    if face.size == 0: continue
+    up = cv2.resize(face, (0,0), fx=1.5, fy=1.5, interpolation=cv2.INTER_CUBIC)
+    den = cv2.fastNlMeansDenoisingColored(up, None, 5, 5, 7, 21)
+    sharp = cv2.addWeighted(den, 1.3, cv2.GaussianBlur(den,(0,0),1.0), -0.3, 0)
+    back = cv2.resize(sharp, (x2-x1, y2-y1), interpolation=cv2.INTER_LANCZOS4)
+    cv[y1:y2, x1:x2] = back
+  return from_cv(cv)
+
+@app.get("/", response_class=HTMLResponse)
+async def index(request: Request):
+  with open(os.path.join(APP_DIR, "app/templates/index.html"), "r", encoding="utf-8") as f:
+    return HTMLResponse(f.read())
+
+@app.post("/api/outpaint")
+async def api_outpaint(
+  file: UploadFile = File(...),
+  expand_top: int = Form(0),
+  expand_right: int = Form(0),
+  expand_bottom: int = Form(0),
+  expand_left: int = Form(0),
+  refine: int = Form(0),
+  face_fix: int = Form(0)
+):
+  try:
+    raw = await file.read()
+    if len(raw) > MAX_UPLOAD_MB * 1024 * 1024:
+      return JSONResponse({"error": f"File too large (>{MAX_UPLOAD_MB}MB)"}, status_code=400)
+    img, _ = read_image_keep_exif(raw)
+    img = clamp_size(img)
+    canvas, mask = expand_canvas_and_mask(img, expand_top, expand_right, expand_bottom, expand_left)
+    out = inpaint_borders(canvas, mask)
+    if refine: out = photoreal_refine(out)
+    if face_fix: out = face_preserve(out)
+    buf = io.BytesIO()
+    out.save(buf, format="PNG"); buf.seek(0)
+    meta = {"original_size": img.size, "expanded":[expand_top,expand_right,expand_bottom,expand_left], "refine":bool(refine), "face_preserve":bool(face_fix)}
+    return StreamingResponse(buf, media_type="image/png", headers={"X-Meta": json.dumps(meta)})
+  except Exception as e:
+    log(f"/api/outpaint error: {e}")
+    return JSONResponse({"error": str(e)}, status_code=500)
+
+@app.get("/api/health")
+async def health():
+  return {"ok": True, "time": datetime.now().isoformat()}
+
+if __name__ == "__main__":
+  ensure_models()
+  import uvicorn
+  log("Starting server")
+  uvicorn.run("main:app", host=HOST, port=PORT, reload=False)
+PY_MAIN
+
+  # index.html
+  install -Dm644 /dev/stdin "$APP_SRC/templates/index.html" <<'HTML_INDEX'
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>RPi5 Local Outpainting</title>
+<link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <div class="container">
+    <h1>RPi5 Local Outpainting (127.0.0.1:8080)</h1>
+    <form id="form" enctype="multipart/form-data">
+      <div class="grid">
+        <div class="card">
+          <label>Upload Image (PNG/JPG, <=20MB)</label>
+          <input type="file" name="file" id="file" accept="image/png,image/jpeg" required />
+          <label>Canvas expand (px per side)</label>
+          <div>
+            <div class="row">
+              <label for="expand_top">Top</label>
+              <input type="number" name="expand_top" id="expand_top" value="0" min="0" />
+            </div>
+            <div class="row">
+              <label for="expand_right">Right</label>
+              <input type="number" name="expand_right" id="expand_right" value="0" min="0" />
+            </div>
+            <div class="row">
+              <label for="expand_bottom">Bottom</label>
+              <input type="number" name="expand_bottom" id="expand_bottom" value="0" min="0" />
+            </div>
+            <div class="row">
+              <label for="expand_left">Left</label>
+              <input type="number" name="expand_left" id="expand_left" value="0" min="0" />
+            </div>
+          </div>
+          <div class="row">
+            <label><input type="checkbox" name="refine" id="refine" /> Photoreal refine (CPU)</label>
+          </div>
+          <div class="row">
+            <label><input type="checkbox" name="face_fix" id="face_fix" /> Face preserve</label>
+          </div>
+          <button type="submit">Process</button>
+        </div>
+        <div class="card">
+          <div class="preview">
+            <div>
+              <h3>Before</h3>
+              <img id="before" />
+            </div>
+            <div>
+              <h3>After</h3>
+              <img id="after" />
+              <a id="download" download="outpaint.png" class="button">Download PNG</a>
+            </div>
+          </div>
+          <pre id="log" class="log"></pre>
+        </div>
+      </div>
+    </form>
+  </div>
+<script>
+const form = document.getElementById('form');
+const fileInput = document.getElementById('file');
+const beforeImg = document.getElementById('before');
+const afterImg = document.getElementById('after');
+const logEl = document.getElementById('log');
+const dl = document.getElementById('download');
+
+fileInput.addEventListener('change', () => {
+  const f = fileInput.files[0];
+  if (f) { beforeImg.src = URL.createObjectURL(f); }
+});
+
+form.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  logEl.textContent = 'Processing...';
+  const fd = new FormData(form);
+  fd.set('refine', document.getElementById('refine').checked ? '1':'0');
+  fd.set('face_fix', document.getElementById('face_fix').checked ? '1':'0');
+  try {
+    const res = await fetch('/api/outpaint', { method:'POST', body: fd });
+    if (!res.ok) {
+      const j = await res.json().catch(()=>({error:res.statusText}));
+      throw new Error(j.error || ('HTTP '+res.status));
+    }
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    afterImg.src = url;
+    dl.href = url;
+    logEl.textContent = 'Done.';
+  } catch (err) {
+    logEl.textContent = 'Error: ' + err.message;
+  }
+});
+</script>
+</body>
+</html>
+HTML_INDEX
+
+  # style.css
+  install -Dm644 /dev/stdin "$APP_SRC/static/style.css" <<'CSS_STYLE'
+body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, Arial, sans-serif; background:#0b0f14; color:#dbe0e8; }
+.container { max-width: 1100px; margin: 24px auto; padding: 8px; }
+.grid { display:grid; grid-template-columns: 1fr 1fr; gap:16px; }
+.card { background:#121823; border:1px solid #1e2633; border-radius:16px; padding:16px; box-shadow: 0 6px 24px rgba(0,0,0,0.35); }
+.row { display:flex; gap:8px; align-items:center; margin:8px 0; }
+input[type=number], input[type=file] { width:100%; background:#0f1420; color:#e7ecf5; border:1px solid #263044; border-radius:8px; padding:8px; }
+button, .button { background:#2f6fed; color:white; border:none; border-radius:10px; padding:10px 14px; cursor:pointer; text-decoration:none; display:inline-block; }
+button:hover, .button:hover { filter:brightness(1.1); }
+.preview { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+.preview img { max-width:100%; border-radius:10px; border:1px solid #263044; background:#0f1420; }
+.log { background:#0f1420; color:#b8c1d4; border:1px solid #263044; border-radius:10px; padding:10px; max-height:220px; overflow:auto; }
+CSS_STYLE
+
+  # run_op
+  install -Dm755 /dev/stdin "$HOME/run_op" <<'RUN_OP'
+#!/usr/bin/env bash
+# RPi5 Outpainting — Launcher (localhost only)
+set -euo pipefail
+APP_DIR="$HOME/op_app"
+VENV_DIR="$APP_DIR/.venv"
+LOG_DIR="$APP_DIR/logs"
+HOST="127.0.0.1"
+PORT="8080"
+die(){ printf "\033[31m[ERR]\033[0m %s\n" "$*" >&2; exit 1; }
+[ -d "$APP_DIR" ] || die "Missing $APP_DIR (run setup)"
+[ -d "$VENV_DIR" ] || die "Missing venv (run setup)"
+[ -f "$APP_DIR/app/main.py" ] || die "Missing backend main.py"
+[ -f "$APP_DIR/app/__init__.py" ] || install -Dm644 /dev/stdin "$APP_DIR/app/__init__.py" <<<"# package marker"
+mkdir -p "$LOG_DIR"
+if ss -ltn | awk '{print $4}' | grep -q "^${HOST}:${PORT}\$"; then die "Port ${PORT} in use"; fi
+# shellcheck disable=SC1091
+source "$VENV_DIR/bin/activate"
+cd "$APP_DIR"
+export PYTHONUNBUFFERED=1
+uvicorn app.main:app --host "$HOST" --port "$PORT" --no-access-log --log-level info 2>&1 | tee -a "$LOG_DIR/uvicorn.log"
+RUN_OP
+
+  # systemd unit (optional)
+  install -Dm644 /dev/stdin "$SYS_DIR/op.service" <<'UNIT_FILE'
+[Unit]
+Description=Local Outpainting (RPi5) - 127.0.0.1:8080
+After=network.target
+[Service]
+Type=simple
+User=%i
+WorkingDirectory=%h/op_app
+ExecStart=%h/op_app/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8080 --no-access-log --log-level info
+Restart=on-failure
+Environment=PYTHONUNBUFFERED=1
+[Install]
+WantedBy=default.target
+UNIT_FILE
+
+  # README
+  install -Dm644 /dev/stdin "$APP_DIR/README.md" <<'README_MD'
+# RPi5 Local Outpainting (CPU-only, 127.0.0.1)
+## Quick Start
+bash ~/setup_op
+~/run_op
+# open http://127.0.0.1:8080
+## Optional systemd (user)
+mkdir -p ~/.config/systemd/user/
+cp ~/op_app/systemd/op.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now op.service
+journalctl --user -u op.service -f
+README_MD
+}
+
+self_test(){
+  # shellcheck disable=SC1091
+  source "$VENV_DIR/bin/activate"
+  python - <<'PY_TEST'
+import cv2, numpy, PIL, fastapi, uvicorn
+print("OK:", "cv2", cv2.__version__, "numpy", numpy.__version__, "PIL", PIL.__version__, "fastapi", fastapi.__version__)
+PY_TEST
+}
+
+main(){
+  echo "=============================================="
+  echo " Raspberry Pi Outpainting — Installer"
+  echo "=============================================="
+  check_python
+  check_port_free
+  mk_layout
+  install_apt_deps
+  create_venv
+  write_files
+  self_test
+  green "Setup complete. Run with: ~/run_op"
+}
+main "$@"
+SH
+
+exec "$HOME/setup_op" "$@"

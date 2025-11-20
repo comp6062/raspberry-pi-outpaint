@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+APP_DIR="${HOME}/op_app"
+VENV_DIR="${APP_DIR}/.venv"
+HOST="127.0.0.1"
+PORT="8080"
+
+if [ ! -d "${VENV_DIR}" ]; then
+  echo "Virtualenv not found at ${VENV_DIR}. Run ~/setup_op first."
+  exit 1
+fi
+
+source "${VENV_DIR}/bin/activate"
+
+echo "=============================================="
+echo " Outpainting Launcher (CPU, LaMa + Face-Preserve)"
+echo "=============================================="
+python - <<'PY'
+import platform, sys
+print(f"- Platform: {platform.platform()}")
+print(f"- Python  : {platform.python_version()}")
+try:
+    import torch
+    print(f"- torch   : {getattr(torch, '__version__', 'n/a')}")
+except Exception as e:
+    print(f"- torch   : not installed ({e})")
+try:
+    import onnxruntime as ort
+    print(f"- onnxrt  : {ort.__version__}")
+except Exception as e:
+    print(f"- onnxrt  : not installed ({e})")
+PY
+
+export OP_HOST="${HOST}"
+export OP_PORT="${PORT}"
+export OP_APP_DIR="${APP_DIR}"
+
+exec python "${APP_DIR}/app/main.py"

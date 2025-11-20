@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>RPi5 Local Outpainting</title>
+<link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <div class="container">
+    <h1>RPi5 Local Outpainting (127.0.0.1:8080)</h1>
+    <form id="form" enctype="multipart/form-data">
+      <div class="grid">
+        <div class="card">
+          <label>Upload Image (PNG/JPG, <=20MB)</label>
+          <input type="file" name="file" id="file" accept="image/png,image/jpeg" required />
+          <label>Canvas expand (px per side)</label>
+          <div>
+            <div class="row">
+              <label for="expand_top">Top</label>
+              <input type="number" name="expand_top" id="expand_top" value="0" min="0" />
+            </div>
+            <div class="row">
+              <label for="expand_right">Right</label>
+              <input type="number" name="expand_right" id="expand_right" value="0" min="0" />
+            </div>
+            <div class="row">
+              <label for="expand_bottom">Bottom</label>
+              <input type="number" name="expand_bottom" id="expand_bottom" value="0" min="0" />
+            </div>
+            <div class="row">
+              <label for="expand_left">Left</label>
+              <input type="number" name="expand_left" id="expand_left" value="0" min="0" />
+            </div>
+          </div>
+          <div class="row">
+            <label><input type="checkbox" name="refine" id="refine" /> Photoreal refine (CPU)</label>
+          </div>
+          <div class="row">
+            <label><input type="checkbox" name="face_fix" id="face_fix" /> Face preserve</label>
+          </div>
+          <button type="submit">Process</button>
+        </div>
+        <div class="card">
+          <div class="preview">
+            <div>
+              <h3>Before</h3>
+              <img id="before" />
+            </div>
+            <div>
+              <h3>After</h3>
+              <img id="after" />
+              <a id="download" download="outpaint.png" class="button">Download PNG</a>
+            </div>
+          </div>
+          <pre id="log" class="log"></pre>
+        </div>
+      </div>
+    </form>
+  </div>
+<script>
+const form = document.getElementById('form');
+const fileInput = document.getElementById('file');
+const beforeImg = document.getElementById('before');
+const afterImg = document.getElementById('after');
+const logEl = document.getElementById('log');
+const dl = document.getElementById('download');
+
+fileInput.addEventListener('change', () => {
+  const f = fileInput.files[0];
+  if (f) { beforeImg.src = URL.createObjectURL(f); }
+});
+
+form.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  logEl.textContent = 'Processing...';
+  const fd = new FormData(form);
+  fd.set('refine', document.getElementById('refine').checked ? '1':'0');
+  fd.set('face_fix', document.getElementById('face_fix').checked ? '1':'0');
+  try {
+    const res = await fetch('/api/outpaint', { method:'POST', body: fd });
+    if (!res.ok) {
+      const j = await res.json().catch(()=>({error:res.statusText}));
+      throw new Error(j.error || ('HTTP '+res.status));
+    }
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    afterImg.src = url;
+    dl.href = url;
+    logEl.textContent = 'Done.';
+  } catch (err) {
+    logEl.textContent = 'Error: ' + err.message;
+  }
+});
+</script>
+</body>
+</html>

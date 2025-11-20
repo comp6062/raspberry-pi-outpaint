@@ -1,0 +1,15 @@
+[Unit]
+Description=Raspberry Pi Outpainting App
+After=network.target
+
+[Service]
+Type=simple
+User=%i
+WorkingDirectory=%h/op_app
+ExecStart=%h/op_app/run_op
+Restart=on-failure
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
